@@ -1,0 +1,105 @@
+# ================================================================
+# Local-First Financial AI Trading Application — Configuration
+# ================================================================
+
+alpaca:
+  # API credentials loaded from .env via environment variables
+  paper_mode: true
+
+llm:
+  # LM Studio endpoint loaded from .env
+  temperature: 0.3
+  max_tokens: 4096
+  timeout_seconds: 120
+  retry_attempts: 3
+  retry_delay_seconds: 5
+
+trading:
+  mode: advisory                    # autonomous | advisory
+  max_trades_per_day: 10
+  min_trade_interval_minutes: 15
+  trading_hours_only: true          # Restrict to 9:30 AM – 4:00 PM ET
+  extended_hours: false
+  analysis_interval_minutes: 5     # How often to run the analysis loop
+
+  # Asset universe — S&P 500 large-caps with high liquidity
+  asset_universe:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - TSLA
+    - BRK.B
+    - JPM
+    - JNJ
+    - V
+    - UNH
+    - HD
+    - PG
+    - MA
+    - XOM
+    - DIS
+    - COST
+    - PEP
+    - ABBV
+    - AVGO
+    - KO
+    - MRK
+    - LLY
+    - TMO
+    - CSCO
+    - ACN
+    - MCD
+    - ABT
+    - WMT
+    - CRM
+    - DHR
+    - ADBE
+    - NKE
+    - TXN
+    - NEE
+    - PM
+    - ORCL
+    - NFLX
+    - AMD
+    - INTC
+    - QCOM
+    - UPS
+    - LOW
+    - RTX
+    - HON
+    - AMGN
+    - SBUX
+    - CAT
+    - BA
+
+risk:
+  max_position_pct: 0.10           # 10% of portfolio per stock
+  max_concurrent_positions: 15
+  trailing_stop_pct: 0.03          # 3% trailing stop
+  daily_drawdown_halt_pct: 0.05    # 5% daily drawdown → halt
+  total_drawdown_halt_pct: 0.15    # 15% total drawdown → halt
+  min_confidence_threshold: 0.6    # AI confidence ≥ 0.6 to trade
+  half_kelly: true                 # Use half-Kelly for position sizing
+
+indicators:
+  rsi_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2.0
+  sma_periods: [20, 50, 200]
+  atr_period: 14
+  stoch_k: 14
+  stoch_d: 3
+  stoch_smooth: 3
+
+database:
+  path: data/portfolio.db
+
+logging:
+  decision_log_dir: logs/decisions
+  level: INFO
