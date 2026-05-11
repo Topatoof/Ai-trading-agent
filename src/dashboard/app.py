@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 
 import dash
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
-from dash import Input, Output, State, callback_context, dcc, html
+from dash import ALL, Input, Output, State, callback_context, dcc, html
 
 from src.config import get_config
 from src.dashboard.layouts.portfolio import create_portfolio_layout
@@ -21,11 +22,52 @@ from src.dashboard.layouts.trading import create_trading_layout
 from src.dashboard.layouts.history import create_history_layout
 from src.dashboard.layouts.backtest import create_backtest_layout
 from src.dashboard.layouts.settings import create_settings_layout
+from src.dashboard.reasoning_format import format_activity_reasoning
 
 logger = logging.getLogger(__name__)
 
 # ── App reference (set by create_app) ──────────────────────────
 _trading_app = None
+
+
+def _history_ts_key(dt: datetime | None) -> str:
+    """ISO string safe for sorting (avoids naive/aware TypeError in sort)."""
+    if dt is None:
+        return ""
+    try:
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.isoformat()
+    except Exception:
+        pass
+    return dt.replace(tzinfo=None).isoformat()
+
+
+def _dt_delta_seconds(a: datetime | None, b: datetime | None) -> float | None:
+    if not a or not b:
+        return None
+    try:
+        return abs((a - b).total_seconds())
+    except TypeError:
+        a0 = a.replace(tzinfo=None) if getattr(a, "tzinfo", None) else a
+        b0 = b.replace(tzinfo=None) if getattr(b, "tzinfo", None) else b
+        return abs((a0 - b0).total_seconds())
+
+
+def _match_approved_rec_for_trade(trade, approved_recs: list, window_sec: float = 300.0):
+    """Pair an advisory trade with the approval that likely triggered it."""
+    best = None
+    best_d: float | None = None
+    for r in approved_recs:
+        if r.symbol != trade.symbol or r.action != trade.side:
+            continue
+        r_ts = r.resolved_at or r.created_at
+        d = _dt_delta_seconds(trade.timestamp, r_ts)
+        if d is None or d > window_sec:
+            continue
+        if best_d is None or d < best_d:
+            best_d = d
+            best = r
+    return best
 
 TAB_IDS = ["portfolio", "trading", "history", "backtest", "settings"]
 
@@ -194,31 +236,155 @@ def _register_callbacks(app):
             Output("trade-log-table", "data"),
             Output("cumulative-pnl-chart", "figure"),
         ],
-        Input("refresh-interval", "n_intervals"),
-        prevent_initial_call=True,
+        [
+            Input("refresh-interval", "n_intervals"),
+            Input("main-tabs", "value"),
+        ],
+        prevent_initial_call=False,
     )
-    def refresh_history(n):
-        from src.database import Trade, get_session
+    def refresh_history(_n, active_tab):
+        from sqlalchemy.sql import func
+
+        from src.dashboard.layouts import history as history_layout
+        from src.database import Recommendation, Trade, get_session
+
+        if active_tab != "history":
+            raise dash.exceptions.PreventUpdate
+
         session = get_session()
         try:
             trades = session.query(Trade).order_by(Trade.timestamp.desc()).limit(200).all()
-            if not trades:
-                raise dash.exceptions.PreventUpdate
+            rejected = (
+                session.query(Recommendation)
+                .filter(Recommendation.status == "rejected")
+                .order_by(
+                    func.coalesce(
+                        Recommendation.resolved_at,
+                        Recommendation.created_at,
+                    ).desc(),
+                )
+                .limit(200)
+                .all()
+            )
+            approved = (
+                session.query(Recommendation)
+                .filter(Recommendation.status == "approved")
+                .order_by(
+                    func.coalesce(
+                        Recommendation.resolved_at,
+                        Recommendation.created_at,
+                    ).desc(),
+                )
+                .limit(200)
+                .all()
+            )
 
-            rows = []
+            matched_rec_ids: set[int] = set()
+            rows: list[dict] = []
+
             for t in trades:
+                ts = t.timestamp
+                conf = t.ai_confidence
+                conf_s = f"{conf:.0%}" if conf is not None else "—"
+                pnl_s = f"${t.pnl:+,.2f}" if t.pnl is not None else "$0.00"
+
+                partner = None
+                # Match approvals for advisory rows; also try when mode is missing in older DB rows.
+                if (t.mode or "").lower() != "autonomous":
+                    partner = _match_approved_rec_for_trade(t, approved)
+
+                if partner:
+                    matched_rec_ids.add(int(partner.id))
+                    fr = format_activity_reasoning(partner.reasoning or t.ai_reasoning or "")
+                    oid = (t.alpaca_order_id or "").strip()
+                    status_bits = [t.status or "—"]
+                    if oid:
+                        status_bits.append(f"Alpaca order {oid}")
+                    rows.append({
+                        "_sort": ts,
+                        "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
+                        "kind": "Approved recommendation",
+                        "symbol": t.symbol,
+                        "side": t.side,
+                        "qty": t.qty,
+                        "price": t.price if t.price is not None else "—",
+                        "mode": t.mode or "advisory",
+                        "status": " · ".join(status_bits),
+                        "confidence": conf_s,
+                        "pnl": pnl_s,
+                        "summary": fr["summary"],
+                        "rationale": fr["details"],
+                    })
+                    continue
+
+                fr = format_activity_reasoning(t.ai_reasoning or "")
                 rows.append({
-                    "timestamp": t.timestamp.strftime("%m/%d %H:%M") if t.timestamp else "",
+                    "_sort": ts,
+                    "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
+                    "kind": "Order placed",
                     "symbol": t.symbol,
                     "side": t.side,
                     "qty": t.qty,
-                    "price": t.price,
-                    "mode": t.mode,
-                    "status": t.status,
-                    "confidence": t.ai_confidence,
-                    "pnl": t.pnl or 0,
-                    "reasoning": (t.ai_reasoning or "")[:80],
+                    "price": t.price if t.price is not None else "—",
+                    "mode": t.mode or "—",
+                    "status": t.status or "—",
+                    "confidence": conf_s,
+                    "pnl": pnl_s,
+                    "summary": fr["summary"],
+                    "rationale": fr["details"],
                 })
+
+            for r in approved:
+                if int(r.id) in matched_rec_ids:
+                    continue
+                fr = format_activity_reasoning(r.reasoning or "")
+                ts = r.resolved_at or r.created_at
+                conf = r.confidence
+                conf_s = f"{conf:.0%}" if conf is not None else "—"
+                rows.append({
+                    "_sort": ts,
+                    "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
+                    "kind": "Approved recommendation",
+                    "symbol": r.symbol,
+                    "side": r.action,
+                    "qty": r.qty,
+                    "price": "—",
+                    "mode": "advisory",
+                    "status": "Approved (no nearby order row — check Alpaca / logs)",
+                    "confidence": conf_s,
+                    "pnl": "—",
+                    "summary": fr["summary"],
+                    "rationale": fr["details"],
+                })
+
+            for r in rejected:
+                fr = format_activity_reasoning(r.reasoning or "")
+                ts = r.resolved_at or r.created_at
+                conf = r.confidence
+                conf_s = f"{conf:.0%}" if conf is not None else "—"
+                note = (r.user_note or "").strip()
+                rationale = fr["details"]
+                if note:
+                    rationale = f"{rationale}\n\nDecline note: {note}"
+                rows.append({
+                    "_sort": ts,
+                    "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
+                    "kind": "Declined recommendation",
+                    "symbol": r.symbol,
+                    "side": r.action,
+                    "qty": r.qty,
+                    "price": "—",
+                    "mode": "—",
+                    "status": "Rejected",
+                    "confidence": conf_s,
+                    "pnl": "—",
+                    "summary": fr["summary"],
+                    "rationale": rationale,
+                })
+
+            rows.sort(key=lambda x: _history_ts_key(x["_sort"]), reverse=True)
+            for row in rows:
+                row.pop("_sort", None)
 
             sells = [t for t in trades if t.side == "SELL" and t.pnl is not None]
             total = len(sells)
@@ -226,7 +392,6 @@ def _register_callbacks(app):
             realized = sum(t.pnl or 0 for t in sells)
             win_rate = f"{wins/total:.0%}" if total > 0 else "—"
 
-            # Cumulative P&L chart
             cum_pnl = []
             running = 0
             for t in reversed(sells):
@@ -251,7 +416,15 @@ def _register_callbacks(app):
                 font=dict(family="Inter", color="#94a3b8"), showlegend=False,
             )
 
-            pnl_cls = "positive" if realized >= 0 else "negative"
+            if not trades and not rejected and not approved:
+                return (
+                    "0",
+                    "—",
+                    "$+0.00",
+                    [],
+                    history_layout._empty(),
+                )
+
             return (
                 str(total),
                 win_rate,
@@ -259,8 +432,6 @@ def _register_callbacks(app):
                 rows,
                 fig,
             )
-        except dash.exceptions.PreventUpdate:
-            raise
         except Exception as e:
             logger.error("History refresh error: %s", e)
             raise dash.exceptions.PreventUpdate
@@ -291,6 +462,11 @@ def _register_callbacks(app):
             cards = []
             for rec in recs:
                 action_cls = "rec-action buy" if rec.action == "BUY" else "rec-action sell"
+                reasoning = (rec.reasoning or "").strip()
+                parts = [p.strip() for p in reasoning.split(";") if p.strip()]
+                thesis = parts[0] if parts else "No analysis summary provided."
+                supporting = " | ".join(parts[1:3]) if len(parts) > 1 else "No additional supporting signals."
+                created_text = rec.created_at.strftime("%H:%M:%S") if rec.created_at else "N/A"
                 cards.append(html.Div([
                     html.Div([
                         html.Span(rec.symbol, className="rec-symbol"),
@@ -298,8 +474,29 @@ def _register_callbacks(app):
                     ], className="rec-header"),
                     html.Div(f"{rec.qty} shares • Confidence: {rec.confidence:.0%}",
                              style={"fontSize": "12px", "color": "#94a3b8", "marginBottom": "6px"}),
-                    html.Div(rec.reasoning or "", style={"fontSize": "12px", "color": "#64748b",
-                                                          "marginBottom": "10px"}),
+                    html.Div(
+                        [
+                            html.Div(
+                                f"Summary: {thesis}",
+                                style={"fontSize": "12px", "color": "#cbd5e1", "marginBottom": "4px"},
+                            ),
+                            html.Div(
+                                f"Justification: {supporting}",
+                                style={"fontSize": "12px", "color": "#94a3b8", "marginBottom": "4px"},
+                            ),
+                            html.Div(
+                                f"Risk: {rec.risk_level or 'N/A'} • Created: {created_text}",
+                                style={"fontSize": "11px", "color": "#64748b"},
+                            ),
+                        ],
+                        style={
+                            "background": "rgba(255,255,255,0.02)",
+                            "border": "1px solid rgba(255,255,255,0.06)",
+                            "borderRadius": "8px",
+                            "padding": "8px 10px",
+                            "marginBottom": "10px",
+                        },
+                    ),
                     html.Div([
                         html.Button("✓ Approve", id={"type": "approve-rec", "index": rec.id},
                                     className="btn-primary btn-success",
@@ -317,6 +514,134 @@ def _register_callbacks(app):
             raise dash.exceptions.PreventUpdate
         finally:
             session.close()
+
+    # ── Recommendation actions (approve/reject) ─────────────
+    @app.callback(
+        Output("action-result", "children", allow_duplicate=True),
+        [
+            Input({"type": "approve-rec", "index": ALL}, "n_clicks"),
+            Input({"type": "reject-rec", "index": ALL}, "n_clicks"),
+        ],
+        prevent_initial_call=True,
+    )
+    def handle_recommendation_actions(approve_clicks, reject_clicks):
+        if not _trading_app:
+            raise dash.exceptions.PreventUpdate
+
+        ctx = callback_context
+        if not ctx.triggered:
+            raise dash.exceptions.PreventUpdate
+
+        prop_id = ctx.triggered[0]["prop_id"].split(".")[0]
+        try:
+            btn_id = json.loads(prop_id)
+            rec_id = int(btn_id.get("index"))
+            action_type = btn_id.get("type")
+        except Exception:
+            raise dash.exceptions.PreventUpdate
+
+        if action_type == "approve-rec":
+            result = _trading_app.executor.approve_recommendation(rec_id)
+            if result.get("status") in {"submitted", "queued"}:
+                return f"✅ Recommendation {rec_id} approved ({result.get('status')})"
+            if result.get("status") == "not_found":
+                return f"Recommendation {rec_id} is no longer pending"
+            return f"❌ Approve failed for recommendation {rec_id}: {result.get('error', 'unknown error')}"
+
+        if action_type == "reject-rec":
+            result = _trading_app.executor.reject_recommendation(rec_id, reason="Rejected from dashboard")
+            if result.get("status") == "rejected":
+                return f"Rejected recommendation {rec_id}"
+            if result.get("status") == "not_found":
+                return f"Recommendation {rec_id} is no longer pending"
+            return f"❌ Reject failed for recommendation {rec_id}: {result.get('error', 'unknown error')}"
+
+        raise dash.exceptions.PreventUpdate
+
+    # ── Analysis progress + AI insights ─────────────────────
+    @app.callback(
+        [
+            Output("analysis-progress", "value"),
+            Output("analysis-progress", "animated"),
+            Output("analysis-progress", "color"),
+            Output("analysis-progress-label", "children"),
+            Output("insights-feed", "children"),
+        ],
+        Input("fast-refresh", "n_intervals"),
+        prevent_initial_call=False,
+    )
+    def refresh_analysis_status(n):
+        if not _trading_app:
+            idle_msg = "Waiting for trading engine..."
+            return 0, False, "secondary", idle_msg, [
+                html.Div([
+                    html.Div("System", className="timestamp"),
+                    html.Div(idle_msg, style={"color": "#94a3b8"}),
+                ], className="insight-entry")
+            ]
+
+        state = getattr(_trading_app, "analysis_state", {}) or {}
+        pct = int(state.get("progress_pct", 0))
+        in_progress = bool(state.get("in_progress", False))
+        stage = str(state.get("stage", "idle"))
+        msg = str(state.get("message", "Waiting for first analysis cycle..."))
+
+        if stage == "failed":
+            color = "danger"
+        elif stage == "complete":
+            color = "success"
+        elif in_progress:
+            color = "primary"
+        else:
+            color = "secondary"
+
+        # Build recent AI insights from decision logs
+        entries = []
+        try:
+            recent = _trading_app.audit.get_recent_decisions(limit=5)
+            for item in recent:
+                ts = item.get("timestamp")
+                ts_text = datetime.fromisoformat(ts).strftime("%H:%M:%S") if ts else "Recent"
+
+                proposals = json.loads(item.get("trade_proposals", "[]") or "[]")
+                executions = json.loads(item.get("execution_results", "[]") or "[]")
+                risks = json.loads(item.get("risk_decisions", "[]") or "[]")
+
+                queued = sum(1 for x in executions if x.get("status") == "queued")
+                submitted = sum(1 for x in executions if x.get("status") == "submitted")
+                rejected = sum(1 for x in executions if x.get("status") == "rejected")
+                rejected_reasons = [
+                    "; ".join(r.get("reasons", []))
+                    for r in risks if not r.get("approved", False)
+                ]
+                reason_text = rejected_reasons[0] if rejected_reasons else "No blocking reasons"
+
+                entries.append(
+                    html.Div([
+                        html.Div(ts_text, className="timestamp"),
+                        html.Div(
+                            f"Proposals: {len(proposals)} | Queued: {queued} | "
+                            f"Submitted: {submitted} | Rejected: {rejected}",
+                            style={"color": "#f1f5f9"},
+                        ),
+                        html.Div(
+                            f"Top risk note: {reason_text[:140]}",
+                            style={"color": "#94a3b8", "marginTop": "4px"},
+                        ),
+                    ], className="insight-entry")
+                )
+        except Exception as e:
+            logger.error("Failed to refresh insights feed: %s", e)
+
+        if not entries:
+            entries = [
+                html.Div([
+                    html.Div("System", className="timestamp"),
+                    html.Div("No analysis insights yet", style={"color": "#94a3b8"}),
+                ], className="insight-entry")
+            ]
+
+        return pct, in_progress, color, msg, entries
 
     # ── Circuit breaker status ─────────────────────────────
     @app.callback(
@@ -422,6 +747,26 @@ def _register_callbacks(app):
             return "Circuit breaker reset"
         raise dash.exceptions.PreventUpdate
 
+    # ── Close all positions ──────────────────────────────────
+    @app.callback(
+        Output("action-result", "children", allow_duplicate=True),
+        Input("btn-close-all", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def close_all_positions(n):
+        if not (_trading_app and n):
+            raise dash.exceptions.PreventUpdate
+        try:
+            open_positions = len(_trading_app.portfolio.positions)
+            if open_positions == 0:
+                return "No open positions to close"
+            # Uses Alpaca bulk close endpoint for immediate flattening.
+            _trading_app.executor._client.close_all_positions(cancel_orders=True)
+            return f"Close-all requested for {open_positions} position(s)"
+        except Exception as e:
+            logger.error("Close all positions failed: %s", e)
+            return f"❌ Close-all failed: {e}"
+
     # ── Settings: health indicators ────────────────────────
     @app.callback(
         [
@@ -515,8 +860,26 @@ def _build_allocation_chart(portfolio):
     return fig
 
 
-def run_dashboard(trading_app=None, port: int = 8050, debug: bool = False):
+def run_dashboard(trading_app=None, port: int = 8050, debug: bool | None = None):
     """Entry point to launch the dashboard server."""
+    if debug is None:
+        debug = os.getenv("DASH_DEBUG", "1").lower() not in ("0", "false", "no")
     app = create_app(trading_app)
-    logger.info("Starting dashboard on http://localhost:%d", port)
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    logger.info(
+        "Starting dashboard on http://localhost:%d (debug=%s, hot_reload=%s)",
+        port,
+        debug,
+        debug,
+    )
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=debug,
+        dev_tools_hot_reload=debug,
+        use_reloader=debug,
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    run_dashboard()

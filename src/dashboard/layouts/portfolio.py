@@ -62,7 +62,7 @@ def create_portfolio_layout():
                     {"name": "Mkt Value", "id": "market_value", "type": "numeric",
                      "format": {"specifier": "$,.2f"}},
                     {"name": "P&L", "id": "pnl", "type": "numeric",
-                     "format": {"specifier": "$+,.2f"}},
+                     "format": {"specifier": "$,.2f"}},
                     {"name": "P&L %", "id": "pnl_pct", "type": "numeric",
                      "format": {"specifier": "+.2%"}},
                 ],

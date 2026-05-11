@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, time as dtime
 from typing import Optional
 
@@ -55,6 +56,33 @@ class TradingApp:
         self.executor = TradeExecutor(self.portfolio, self.risk_manager)
         self.scheduler = BackgroundScheduler()
         self._running = False
+        self.analysis_state = {
+            "in_progress": False,
+            "progress_pct": 0,
+            "stage": "idle",
+            "message": "Waiting for first analysis cycle...",
+            "started_at": None,
+            "last_completed_at": None,
+        }
+
+    def _set_analysis_state(
+        self,
+        *,
+        progress_pct: int,
+        stage: str,
+        message: str,
+        in_progress: bool | None = None,
+    ):
+        """Update progress metadata consumed by the dashboard."""
+        self.analysis_state["progress_pct"] = max(0, min(100, int(progress_pct)))
+        self.analysis_state["stage"] = stage
+        self.analysis_state["message"] = message
+        if in_progress is not None:
+            self.analysis_state["in_progress"] = in_progress
+        if in_progress is True:
+            self.analysis_state["started_at"] = datetime.utcnow().isoformat()
+        if in_progress is False:
+            self.analysis_state["last_completed_at"] = datetime.utcnow().isoformat()
 
     def start(self):
         """Initialize and start the trading application."""
@@ -182,144 +210,210 @@ class TradingApp:
 
     def _run_analysis_cycle(self):
         """Single iteration of the analysis pipeline."""
+        started = time.time()
+        self._set_analysis_state(
+            progress_pct=5,
+            stage="starting",
+            message="Starting analysis cycle...",
+            in_progress=True,
+        )
         logger.info("━━━ Analysis cycle starting ━━━")
+        try:
+            # 1. Fetch market data
+            self._set_analysis_state(
+                progress_pct=15,
+                stage="market_data",
+                message="Fetching market data...",
+            )
+            logger.info("Fetching market data...")
+            bars = self.market_data.get_historical_bars(days_back=200)
+            latest = self.market_data.get_latest_bars()
 
-        # 1. Fetch market data
-        logger.info("Fetching market data...")
-        bars = self.market_data.get_historical_bars(days_back=200)
-        latest = self.market_data.get_latest_bars()
+            if not bars:
+                logger.warning("No market data received — aborting cycle")
+                self._set_analysis_state(
+                    progress_pct=100,
+                    stage="complete",
+                    message="No market data available for this cycle",
+                    in_progress=False,
+                )
+                return
 
-        if not bars:
-            logger.warning("No market data received — aborting cycle")
-            return
+            # 2. Compute indicators
+            self._set_analysis_state(
+                progress_pct=35,
+                stage="indicators",
+                message="Computing technical indicators...",
+            )
+            logger.info("Computing indicators...")
+            indicator_snapshots = self.indicator_engine.compute_batch(bars)
 
-        # 2. Compute indicators
-        logger.info("Computing indicators...")
-        indicator_snapshots = self.indicator_engine.compute_batch(bars)
+            # 3. Build market state
+            self._set_analysis_state(
+                progress_pct=50,
+                stage="market_state",
+                message="Preparing market context...",
+            )
+            market_state = MarketState()
+            for symbol, snap in indicator_snapshots.items():
+                latest_bar = latest.get(symbol, {})
+                prev_close = None
+                if symbol in bars and len(bars[symbol]) >= 2:
+                    prev_close = float(bars[symbol]["close"].iloc[-2])
 
-        # 3. Build market state
-        market_state = MarketState()
-        for symbol, snap in indicator_snapshots.items():
-            latest_bar = latest.get(symbol, {})
-            prev_close = None
-            if symbol in bars and len(bars[symbol]) >= 2:
-                prev_close = float(bars[symbol]["close"].iloc[-2])
+                current_price = snap.close or latest_bar.get("close", 0)
+                daily_change = 0.0
+                if prev_close and current_price:
+                    daily_change = (current_price - prev_close) / prev_close
 
-            current_price = snap.close or latest_bar.get("close", 0)
-            daily_change = 0.0
-            if prev_close and current_price:
-                daily_change = (current_price - prev_close) / prev_close
+                # Volume ratio
+                vol_ratio = None
+                if symbol in bars and len(bars[symbol]) >= 20:
+                    avg_vol = bars[symbol]["volume"].tail(20).mean()
+                    curr_vol = latest_bar.get("volume", 0)
+                    if avg_vol > 0:
+                        vol_ratio = curr_vol / avg_vol
 
-            # Volume ratio
-            vol_ratio = None
-            if symbol in bars and len(bars[symbol]) >= 20:
-                avg_vol = bars[symbol]["volume"].tail(20).mean()
-                curr_vol = latest_bar.get("volume", 0)
-                if avg_vol > 0:
-                    vol_ratio = curr_vol / avg_vol
+                market_state.symbols[symbol] = SymbolState(
+                    symbol=symbol,
+                    current_price=current_price,
+                    daily_change_pct=daily_change,
+                    volume=latest_bar.get("volume", 0),
+                    volume_ratio=vol_ratio,
+                    indicators=snap,
+                )
 
-            market_state.symbols[symbol] = SymbolState(
-                symbol=symbol,
-                current_price=current_price,
-                daily_change_pct=daily_change,
-                volume=latest_bar.get("volume", 0),
-                volume_ratio=vol_ratio,
-                indicators=snap,
+            market_state.compute_breadth()
+
+            # 4. Run AI decision engine
+            self._set_analysis_state(
+                progress_pct=70,
+                stage="ai",
+                message="Running AI analysis...",
+            )
+            logger.info(
+                "Running AI analysis (breadth: %.2f, %d symbols)...",
+                market_state.breadth_ratio, len(market_state.symbols),
+            )
+            proposals = self.decision_engine.analyze(
+                market_state=market_state,
+                portfolio_summary=self.portfolio.to_summary(),
+                existing_positions=self.portfolio.held_symbols(),
             )
 
-        market_state.compute_breadth()
+            logger.info("AI produced %d trade proposals", len(proposals))
 
-        # 4. Run AI decision engine
-        logger.info(
-            "Running AI analysis (breadth: %.2f, %d symbols)...",
-            market_state.breadth_ratio, len(market_state.symbols),
-        )
-        proposals = self.decision_engine.analyze(
-            market_state=market_state,
-            portfolio_summary=self.portfolio.to_summary(),
-            existing_positions=self.portfolio.held_symbols(),
-        )
+            # 5. Size positions and evaluate risk
+            self._set_analysis_state(
+                progress_pct=85,
+                stage="risk",
+                message="Applying position sizing and risk checks...",
+            )
+            execution_results = []
+            risk_decisions = []
 
-        logger.info("AI produced %d trade proposals", len(proposals))
-
-        # 5. Size positions and evaluate risk
-        execution_results = []
-        risk_decisions = []
-
-        for proposal in proposals:
-            # Size the position
-            if proposal.action == "BUY":
-                pos_info = self.portfolio.positions.get(proposal.symbol)
-                snap = indicator_snapshots.get(proposal.symbol)
-                proposal.qty = self.position_sizer.calculate_qty(
-                    symbol=proposal.symbol,
-                    current_price=market_state.symbols[proposal.symbol].current_price,
-                    portfolio_equity=self.portfolio.total_equity,
-                    confidence=proposal.confidence,
-                    atr=snap.atr if snap else None,
-                    existing_qty=int(pos_info.qty) if pos_info else 0,
-                    existing_value=pos_info.market_value if pos_info else 0.0,
-                )
-            elif proposal.action == "SELL":
-                pos_info = self.portfolio.positions.get(proposal.symbol)
-                if pos_info:
-                    proposal.qty = self.position_sizer.calculate_sell_qty(
+            for proposal in proposals:
+                # Size the position
+                if proposal.action == "BUY":
+                    pos_info = self.portfolio.positions.get(proposal.symbol)
+                    snap = indicator_snapshots.get(proposal.symbol)
+                    proposal.qty = self.position_sizer.calculate_qty(
                         symbol=proposal.symbol,
-                        held_qty=int(pos_info.qty),
+                        current_price=market_state.symbols[proposal.symbol].current_price,
+                        portfolio_equity=self.portfolio.total_equity,
                         confidence=proposal.confidence,
+                        atr=snap.atr if snap else None,
+                        existing_qty=int(pos_info.qty) if pos_info else 0,
+                        existing_value=pos_info.market_value if pos_info else 0.0,
                     )
-                else:
-                    logger.warning("SELL signal for %s but no position held — skipping", proposal.symbol)
+                elif proposal.action == "SELL":
+                    pos_info = self.portfolio.positions.get(proposal.symbol)
+                    if pos_info:
+                        proposal.qty = self.position_sizer.calculate_sell_qty(
+                            symbol=proposal.symbol,
+                            held_qty=int(pos_info.qty),
+                            confidence=proposal.confidence,
+                        )
+                    else:
+                        logger.warning("SELL signal for %s but no position held — skipping", proposal.symbol)
+                        continue
+
+                if not proposal.qty or proposal.qty <= 0:
                     continue
 
-            if not proposal.qty or proposal.qty <= 0:
-                continue
+                estimated_value = (
+                    proposal.qty
+                    * market_state.symbols[proposal.symbol].current_price
+                )
 
-            estimated_value = (
-                proposal.qty
-                * market_state.symbols[proposal.symbol].current_price
+                # Risk check
+                risk_decision = self.risk_manager.evaluate(
+                    symbol=proposal.symbol,
+                    action=proposal.action,
+                    qty=proposal.qty,
+                    estimated_value=estimated_value,
+                    confidence=proposal.confidence,
+                    portfolio_equity=self.portfolio.total_equity,
+                    cash_available=self.portfolio.cash,
+                    current_positions=self.portfolio.position_values(),
+                    daily_pnl_pct=self.portfolio.daily_pnl_pct,
+                    total_drawdown_pct=self.portfolio.total_drawdown_pct,
+                )
+                risk_decisions.append(risk_decision.to_dict())
+
+                # Execute or queue
+                result = self.executor.process_proposal(proposal, risk_decision)
+                execution_results.append(result)
+
+            # 6. Log the complete decision cycle
+            self._set_analysis_state(
+                progress_pct=95,
+                stage="logging",
+                message="Persisting analysis results...",
             )
-
-            # Risk check
-            risk_decision = self.risk_manager.evaluate(
-                symbol=proposal.symbol,
-                action=proposal.action,
-                qty=proposal.qty,
-                estimated_value=estimated_value,
-                confidence=proposal.confidence,
-                portfolio_equity=self.portfolio.total_equity,
-                cash_available=self.portfolio.cash,
-                current_positions=self.portfolio.position_values(),
-                daily_pnl_pct=self.portfolio.daily_pnl_pct,
-                total_drawdown_pct=self.portfolio.total_drawdown_pct,
+            log_entry = DecisionLogEntry(
+                mode=self.cfg.trading.mode,
+                market_state_summary=market_state.to_llm_context(max_symbols=10),
+                breadth_ratio=market_state.breadth_ratio,
+                indicator_snapshots={
+                    sym: snap.to_dict()
+                    for sym, snap in list(indicator_snapshots.items())[:10]
+                },
+                trade_proposals=[p.to_dict() for p in proposals],
+                risk_decisions=risk_decisions,
+                execution_results=execution_results,
+                portfolio_before={
+                    "equity": self.portfolio.total_equity,
+                    "cash": self.portfolio.cash,
+                    "positions": len(self.portfolio.positions),
+                },
             )
-            risk_decisions.append(risk_decision.to_dict())
+            self.audit.log_decision(log_entry)
 
-            # Execute or queue
-            result = self.executor.process_proposal(proposal, risk_decision)
-            execution_results.append(result)
+            queued = sum(1 for r in execution_results if r.get("status") == "queued")
+            submitted = sum(1 for r in execution_results if r.get("status") == "submitted")
+            rejected = sum(1 for r in execution_results if r.get("status") == "rejected")
+            elapsed = time.time() - started
 
-        # 6. Log the complete decision cycle
-        log_entry = DecisionLogEntry(
-            mode=self.cfg.trading.mode,
-            market_state_summary=market_state.to_llm_context(max_symbols=10),
-            breadth_ratio=market_state.breadth_ratio,
-            indicator_snapshots={
-                sym: snap.to_dict()
-                for sym, snap in list(indicator_snapshots.items())[:10]
-            },
-            trade_proposals=[p.to_dict() for p in proposals],
-            risk_decisions=risk_decisions,
-            execution_results=execution_results,
-            portfolio_before={
-                "equity": self.portfolio.total_equity,
-                "cash": self.portfolio.cash,
-                "positions": len(self.portfolio.positions),
-            },
-        )
-        self.audit.log_decision(log_entry)
-
-        logger.info("━━━ Analysis cycle complete ━━━")
+            self._set_analysis_state(
+                progress_pct=100,
+                stage="complete",
+                message=(
+                    f"Analysis complete in {elapsed:.1f}s — "
+                    f"proposals: {len(proposals)}, queued: {queued}, "
+                    f"submitted: {submitted}, rejected: {rejected}"
+                ),
+                in_progress=False,
+            )
+            logger.info("━━━ Analysis cycle complete ━━━")
+        except Exception:
+            self._set_analysis_state(
+                progress_pct=100,
+                stage="failed",
+                message="Analysis failed — check logs for details",
+                in_progress=False,
+            )
+            raise
 
     def run_single_analysis(self):
         """Run a single analysis cycle manually (for testing / dashboard trigger)."""

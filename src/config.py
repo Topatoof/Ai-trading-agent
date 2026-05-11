@@ -43,6 +43,7 @@ class AlpacaConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     base_url: str = "http://localhost:1234/v1"
+    api_key: str = "lm-studio"
     model: str = "google/gemma-4-e4b"
     temperature: float = 0.3
     max_tokens: int = 4096
@@ -55,7 +56,13 @@ class LLMConfig(BaseModel):
     def load_from_env(cls, values: dict) -> dict:
         base = os.getenv("LM_STUDIO_BASE_URL")
         if base:
+            base = base.rstrip("/")
+            if not base.endswith("/v1"):
+                base = f"{base}/v1"
             values["base_url"] = base
+        key = os.getenv("LM_STUDIO_API_KEY")
+        if key:
+            values["api_key"] = key
         model = os.getenv("LM_STUDIO_MODEL")
         if model:
             values["model"] = model

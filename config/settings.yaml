@@ -81,7 +81,7 @@ risk:
   trailing_stop_pct: 0.03          # 3% trailing stop
   daily_drawdown_halt_pct: 0.05    # 5% daily drawdown → halt
   total_drawdown_halt_pct: 0.15    # 15% total drawdown → halt
-  min_confidence_threshold: 0.6    # AI confidence ≥ 0.6 to trade
+  min_confidence_threshold: 0.5    # AI confidence ≥ 0.5 to trade
   half_kelly: true                 # Use half-Kelly for position sizing
 
 indicators:

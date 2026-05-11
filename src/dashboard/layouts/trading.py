@@ -63,6 +63,20 @@ def create_trading_layout():
             # Quick actions
             html.Div([
                 html.Div("Quick Actions", className="section-title"),
+                html.Div(
+                    id="analysis-progress-label",
+                    children="Idle",
+                    style={"fontSize": "12px", "color": "#94a3b8", "marginBottom": "6px"},
+                ),
+                dbc.Progress(
+                    id="analysis-progress",
+                    value=0,
+                    max=100,
+                    striped=True,
+                    animated=False,
+                    style={"height": "8px", "marginBottom": "12px"},
+                    color="primary",
+                ),
                 html.Button(
                     "▶ Run Analysis Now",
                     id="btn-run-analysis",

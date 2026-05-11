@@ -21,20 +21,36 @@ def create_history_layout():
         ], className="glass-card", style={"marginBottom": "24px"}),
 
         html.Div([
-            html.Div("Trade Log", className="section-title"),
+            html.Div(
+                "Orders & recommendations",
+                className="section-title",
+            ),
+            html.Div(
+                "Placed orders, approved recommendations (with matching order details), "
+                "and declined ideas share one timeline. "
+                "Summary is plain language; rationale expands the indicator notes.",
+                style={
+                    "fontSize": "12px",
+                    "color": "#94a3b8",
+                    "marginTop": "-8px",
+                    "marginBottom": "14px",
+                },
+            ),
             dash_table.DataTable(
                 id="trade-log-table",
                 columns=[
                     {"name": "Time", "id": "timestamp"},
+                    {"name": "Type", "id": "kind"},
                     {"name": "Symbol", "id": "symbol"},
                     {"name": "Side", "id": "side"},
-                    {"name": "Qty", "id": "qty", "type": "numeric"},
-                    {"name": "Price", "id": "price", "type": "numeric"},
+                    {"name": "Qty", "id": "qty"},
+                    {"name": "Price", "id": "price"},
                     {"name": "Mode", "id": "mode"},
                     {"name": "Status", "id": "status"},
-                    {"name": "Confidence", "id": "confidence", "type": "numeric"},
-                    {"name": "P&L", "id": "pnl", "type": "numeric"},
-                    {"name": "Reasoning", "id": "reasoning"},
+                    {"name": "Confidence", "id": "confidence"},
+                    {"name": "P&L", "id": "pnl"},
+                    {"name": "Summary", "id": "summary"},
+                    {"name": "Rationale", "id": "rationale"},
                 ],
                 data=[],
                 style_header={"backgroundColor": "rgba(255,255,255,0.03)", "color": "#94a3b8",
@@ -43,13 +59,49 @@ def create_history_layout():
                 style_cell={"backgroundColor": "transparent", "color": "#f1f5f9",
                             "fontSize": "13px", "fontFamily": "'Inter', sans-serif",
                             "border": "none", "borderBottom": "1px solid rgba(255,255,255,0.04)",
-                            "padding": "10px 14px", "maxWidth": "200px", "overflow": "hidden",
-                            "textOverflow": "ellipsis"},
+                            "padding": "10px 14px", "verticalAlign": "top"},
+                style_cell_conditional=[
+                    {
+                        "if": {"column_id": "rationale"},
+                        "whiteSpace": "pre-wrap",
+                        "minWidth": "280px",
+                        "maxWidth": "520px",
+                        "textAlign": "left",
+                        "lineHeight": "1.45",
+                        "color": "#cbd5e1",
+                        "fontSize": "12px",
+                    },
+                    {
+                        "if": {"column_id": "summary"},
+                        "maxWidth": "260px",
+                        "whiteSpace": "normal",
+                        "textAlign": "left",
+                        "color": "#e2e8f0",
+                        "fontWeight": "500",
+                    },
+                    {
+                        "if": {"column_id": "kind"},
+                        "maxWidth": "140px",
+                        "fontSize": "12px",
+                    },
+                ],
                 style_data_conditional=[
-                    {"if": {"filter_query": "{side} = BUY"}, "color": "#10b981"},
-                    {"if": {"filter_query": "{side} = SELL"}, "color": "#ef4444"},
-                    {"if": {"filter_query": "{pnl} > 0", "column_id": "pnl"}, "color": "#10b981"},
-                    {"if": {"filter_query": "{pnl} < 0", "column_id": "pnl"}, "color": "#ef4444"},
+                    {"if": {"filter_query": "{side} = BUY"}, "color": "#10b981",
+                     "column_id": "side"},
+                    {"if": {"filter_query": "{side} = SELL"}, "color": "#ef4444",
+                     "column_id": "side"},
+                    {
+                        "if": {"filter_query": "{kind} = Declined recommendation"},
+                        "backgroundColor": "rgba(239,68,68,0.06)",
+                    },
+                    {
+                        "if": {"filter_query": "{kind} = Order placed"},
+                        "backgroundColor": "rgba(59,130,246,0.04)",
+                    },
+                    {
+                        "if": {"filter_query": "{kind} = Approved recommendation"},
+                        "backgroundColor": "rgba(16,185,129,0.07)",
+                    },
                 ],
                 page_size=25, sort_action="native", filter_action="native",
             ),

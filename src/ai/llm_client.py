@@ -26,7 +26,7 @@ class LLMClient:
         cfg = get_config().llm
         self._client = OpenAI(
             base_url=cfg.base_url,
-            api_key="lm-studio",  # LM Studio doesn't require a real key
+            api_key=cfg.api_key or "lm-studio",
         )
         self._model = cfg.model
         self._temperature = cfg.temperature
