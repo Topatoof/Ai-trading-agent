@@ -173,11 +173,11 @@ def create_trading_layout():
                 },
                 style_data_conditional=[
                     {
-                        "if": {"filter_query": "{side} = BUY"},
+                        "if": {"filter_query": '{side} = "BUY"'},
                         "color": "#10b981",
                     },
                     {
-                        "if": {"filter_query": "{side} = SELL"},
+                        "if": {"filter_query": '{side} = "SELL"'},
                         "color": "#ef4444",
                     },
                 ],

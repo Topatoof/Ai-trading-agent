@@ -60,7 +60,7 @@ class LLMConfig(BaseModel):
             if not base.endswith("/v1"):
                 base = f"{base}/v1"
             values["base_url"] = base
-        key = os.getenv("LM_STUDIO_API_KEY")
+        key = os.getenv("LM_STUDIO_API_KEY") or os.getenv("LM_API_TOKEN")
         if key:
             values["api_key"] = key
         model = os.getenv("LM_STUDIO_MODEL")

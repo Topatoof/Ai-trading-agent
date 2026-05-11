@@ -58,7 +58,9 @@ def _match_approved_rec_for_trade(trade, approved_recs: list, window_sec: float 
     best = None
     best_d: float | None = None
     for r in approved_recs:
-        if r.symbol != trade.symbol or r.action != trade.side:
+        if (r.symbol or "") != (trade.symbol or ""):
+            continue
+        if (r.action or "").upper() != (trade.side or "").upper():
             continue
         r_ts = r.resolved_at or r.created_at
         d = _dt_delta_seconds(trade.timestamp, r_ts)
@@ -68,6 +70,57 @@ def _match_approved_rec_for_trade(trade, approved_recs: list, window_sec: float 
             best_d = d
             best = r
     return best
+
+
+def _fmt_pct_or_dash(val) -> str:
+    if val is None:
+        return "—"
+    try:
+        return f"{float(val):.0%}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+_HISTORY_TABLE_COLS = (
+    "timestamp",
+    "kind",
+    "symbol",
+    "side",
+    "qty",
+    "price",
+    "mode",
+    "status",
+    "confidence",
+    "pnl",
+    "summary",
+    "rationale",
+)
+
+
+def _sanitize_history_table_rows(rows: list[dict]) -> list[dict]:
+    """
+    Dash DataTable's client filter/styling can throw (e.g. undefined is not an object)
+    when cells are None or non-JSON-native types. Normalize rows for safe patching.
+    """
+    out: list[dict] = []
+    for r in rows:
+        row: dict = {}
+        for k in _HISTORY_TABLE_COLS:
+            v = r.get(k, "")
+            if v is None:
+                row[k] = ""
+            elif isinstance(v, (str, int, float, bool)):
+                row[k] = v
+            elif hasattr(v, "item"):
+                try:
+                    row[k] = v.item()
+                except Exception:
+                    row[k] = str(v)
+            else:
+                row[k] = str(v)
+        out.append(row)
+    return out
+
 
 TAB_IDS = ["portfolio", "trading", "history", "backtest", "settings"]
 
@@ -233,6 +286,7 @@ def _register_callbacks(app):
             Output("hist-total-trades", "children"),
             Output("hist-win-rate", "children"),
             Output("hist-realized-pnl", "children"),
+            Output("hist-avg-wl", "children"),
             Output("trade-log-table", "data"),
             Output("cumulative-pnl-chart", "figure"),
         ],
@@ -304,9 +358,9 @@ def _register_callbacks(app):
                         "_sort": ts,
                         "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
                         "kind": "Approved recommendation",
-                        "symbol": t.symbol,
-                        "side": t.side,
-                        "qty": t.qty,
+                        "symbol": t.symbol or "",
+                        "side": (t.side or "").upper(),
+                        "qty": int(t.qty) if t.qty is not None else 0,
                         "price": t.price if t.price is not None else "—",
                         "mode": t.mode or "advisory",
                         "status": " · ".join(status_bits),
@@ -322,9 +376,9 @@ def _register_callbacks(app):
                     "_sort": ts,
                     "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
                     "kind": "Order placed",
-                    "symbol": t.symbol,
-                    "side": t.side,
-                    "qty": t.qty,
+                    "symbol": t.symbol or "",
+                    "side": (t.side or "").upper(),
+                    "qty": int(t.qty) if t.qty is not None else 0,
                     "price": t.price if t.price is not None else "—",
                     "mode": t.mode or "—",
                     "status": t.status or "—",
@@ -345,9 +399,9 @@ def _register_callbacks(app):
                     "_sort": ts,
                     "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
                     "kind": "Approved recommendation",
-                    "symbol": r.symbol,
-                    "side": r.action,
-                    "qty": r.qty,
+                    "symbol": r.symbol or "",
+                    "side": (r.action or "").upper(),
+                    "qty": int(r.qty) if r.qty is not None else 0,
                     "price": "—",
                     "mode": "advisory",
                     "status": "Approved (no nearby order row — check Alpaca / logs)",
@@ -370,9 +424,9 @@ def _register_callbacks(app):
                     "_sort": ts,
                     "timestamp": ts.strftime("%m/%d %H:%M") if ts else "",
                     "kind": "Declined recommendation",
-                    "symbol": r.symbol,
-                    "side": r.action,
-                    "qty": r.qty,
+                    "symbol": r.symbol or "",
+                    "side": (r.action or "").upper(),
+                    "qty": int(r.qty) if r.qty is not None else 0,
                     "price": "—",
                     "mode": "—",
                     "status": "Rejected",
@@ -386,11 +440,28 @@ def _register_callbacks(app):
             for row in rows:
                 row.pop("_sort", None)
 
-            sells = [t for t in trades if t.side == "SELL" and t.pnl is not None]
+            sells = [
+                t for t in trades
+                if (t.side or "").upper() == "SELL" and t.pnl is not None
+            ]
             total = len(sells)
             wins = sum(1 for t in sells if t.pnl and t.pnl > 0)
             realized = sum(t.pnl or 0 for t in sells)
             win_rate = f"{wins/total:.0%}" if total > 0 else "—"
+
+            wins_pnl = [float(t.pnl) for t in sells if t.pnl is not None and t.pnl > 0]
+            losses_pnl = [float(t.pnl) for t in sells if t.pnl is not None and t.pnl < 0]
+            if wins_pnl and losses_pnl:
+                avg_wl = (
+                    f"${sum(wins_pnl) / len(wins_pnl):+,.0f} / "
+                    f"${sum(losses_pnl) / len(losses_pnl):+,.0f}"
+                )
+            elif wins_pnl:
+                avg_wl = f"Avg win ${sum(wins_pnl) / len(wins_pnl):+,.0f}"
+            elif losses_pnl:
+                avg_wl = f"Avg loss ${sum(losses_pnl) / len(losses_pnl):+,.0f}"
+            else:
+                avg_wl = "—"
 
             cum_pnl = []
             running = 0
@@ -421,19 +492,22 @@ def _register_callbacks(app):
                     "0",
                     "—",
                     "$+0.00",
+                    "—",
                     [],
                     history_layout._empty(),
                 )
 
+            safe_rows = _sanitize_history_table_rows(rows)
             return (
                 str(total),
                 win_rate,
                 f"${realized:+,.2f}",
-                rows,
+                avg_wl,
+                safe_rows,
                 fig,
             )
         except Exception as e:
-            logger.error("History refresh error: %s", e)
+            logger.exception("History refresh error: %s", e)
             raise dash.exceptions.PreventUpdate
         finally:
             session.close()
@@ -442,7 +516,7 @@ def _register_callbacks(app):
     @app.callback(
         Output("recommendations-list", "children"),
         Input("fast-refresh", "n_intervals"),
-        prevent_initial_call=True,
+        prevent_initial_call=False,
     )
     def refresh_recommendations(n):
         from src.database import Recommendation, get_session
@@ -461,19 +535,29 @@ def _register_callbacks(app):
 
             cards = []
             for rec in recs:
-                action_cls = "rec-action buy" if rec.action == "BUY" else "rec-action sell"
+                act = (rec.action or "").upper()
+                if act == "BUY":
+                    action_cls = "rec-action buy"
+                elif act == "SELL":
+                    action_cls = "rec-action sell"
+                else:
+                    action_cls = "rec-action sell"
                 reasoning = (rec.reasoning or "").strip()
                 parts = [p.strip() for p in reasoning.split(";") if p.strip()]
                 thesis = parts[0] if parts else "No analysis summary provided."
                 supporting = " | ".join(parts[1:3]) if len(parts) > 1 else "No additional supporting signals."
                 created_text = rec.created_at.strftime("%H:%M:%S") if rec.created_at else "N/A"
+                qty_disp = int(rec.qty) if rec.qty is not None else 0
+                conf_disp = _fmt_pct_or_dash(rec.confidence)
                 cards.append(html.Div([
                     html.Div([
                         html.Span(rec.symbol, className="rec-symbol"),
                         html.Span(rec.action, className=action_cls),
                     ], className="rec-header"),
-                    html.Div(f"{rec.qty} shares • Confidence: {rec.confidence:.0%}",
-                             style={"fontSize": "12px", "color": "#94a3b8", "marginBottom": "6px"}),
+                    html.Div(
+                        f"{qty_disp} shares • Confidence: {conf_disp}",
+                        style={"fontSize": "12px", "color": "#94a3b8", "marginBottom": "6px"},
+                    ),
                     html.Div(
                         [
                             html.Div(
@@ -515,7 +599,72 @@ def _register_callbacks(app):
         finally:
             session.close()
 
-    # ── Recommendation actions (approve/reject) ─────────────
+    # ── action-result callbacks ─────────────────────────────
+    # Dash requires the FIRST callback for a given Output to use allow_duplicate=False.
+    # Keep run_analysis as the primary owner; all others use allow_duplicate=True.
+
+    @app.callback(
+        Output("action-result", "children"),
+        Input("btn-run-analysis", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def run_analysis(n):
+        if _trading_app and n:
+            from datetime import datetime
+            import time
+            start = time.time()
+            try:
+                _trading_app.run_single_analysis()
+                elapsed = time.time() - start
+                now = datetime.now().strftime("%H:%M:%S")
+                return f"✅ Analysis complete at {now} ({elapsed:.1f}s) — check Pending Recommendations"
+            except Exception as e:
+                now = datetime.now().strftime("%H:%M:%S")
+                return f"❌ Analysis failed at {now}: {e}"
+        raise dash.exceptions.PreventUpdate
+
+    @app.callback(
+        Output("action-result", "children", allow_duplicate=True),
+        Input("btn-sync-portfolio", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def sync_portfolio(n):
+        if _trading_app and n:
+            _trading_app.reconciler.sync()
+            return "Synced"
+        raise dash.exceptions.PreventUpdate
+
+    @app.callback(
+        Output("action-result", "children", allow_duplicate=True),
+        Input("btn-reset-circuit", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def reset_circuit(n):
+        if _trading_app and n:
+            _trading_app.circuit_breaker.manual_reset(_trading_app.portfolio.total_equity)
+            _trading_app.risk_manager.set_circuit_state("NORMAL")
+            return "Circuit breaker reset"
+        raise dash.exceptions.PreventUpdate
+
+    @app.callback(
+        Output("action-result", "children", allow_duplicate=True),
+        Input("btn-close-all", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def close_all_positions(n):
+        if not (_trading_app and n):
+            raise dash.exceptions.PreventUpdate
+        try:
+            open_positions = len(_trading_app.portfolio.positions)
+            if open_positions == 0:
+                return "No open positions to close"
+            # Uses Alpaca bulk close endpoint for immediate flattening.
+            _trading_app.executor._client.close_all_positions(cancel_orders=True)
+            return f"Close-all requested for {open_positions} position(s)"
+        except Exception as e:
+            logger.error("Close all positions failed: %s", e)
+            return f"❌ Close-all failed: {e}"
+
     @app.callback(
         Output("action-result", "children", allow_duplicate=True),
         [
@@ -700,72 +849,6 @@ def _register_callbacks(app):
         adv_cls = "mode-btn active" if mode == "advisory" else "mode-btn"
         auto_cls = "mode-btn active" if mode == "autonomous" else "mode-btn"
         return mode, msg, adv_cls, auto_cls
-
-    # ── Run analysis button ────────────────────────────────
-    @app.callback(
-        Output("action-result", "children"),
-        Input("btn-run-analysis", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def run_analysis(n):
-        if _trading_app and n:
-            from datetime import datetime
-            import time
-            start = time.time()
-            try:
-                _trading_app.run_single_analysis()
-                elapsed = time.time() - start
-                now = datetime.now().strftime("%H:%M:%S")
-                return f"✅ Analysis complete at {now} ({elapsed:.1f}s) — check Pending Recommendations"
-            except Exception as e:
-                now = datetime.now().strftime("%H:%M:%S")
-                return f"❌ Analysis failed at {now}: {e}"
-        raise dash.exceptions.PreventUpdate
-
-    # ── Sync portfolio button ──────────────────────────────
-    @app.callback(
-        Output("action-result", "children", allow_duplicate=True),
-        Input("btn-sync-portfolio", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def sync_portfolio(n):
-        if _trading_app and n:
-            _trading_app.reconciler.sync()
-            return "Synced"
-        raise dash.exceptions.PreventUpdate
-
-    # ── Reset circuit breaker ──────────────────────────────
-    @app.callback(
-        Output("action-result", "children", allow_duplicate=True),
-        Input("btn-reset-circuit", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def reset_circuit(n):
-        if _trading_app and n:
-            _trading_app.circuit_breaker.manual_reset(_trading_app.portfolio.total_equity)
-            _trading_app.risk_manager.set_circuit_state("NORMAL")
-            return "Circuit breaker reset"
-        raise dash.exceptions.PreventUpdate
-
-    # ── Close all positions ──────────────────────────────────
-    @app.callback(
-        Output("action-result", "children", allow_duplicate=True),
-        Input("btn-close-all", "n_clicks"),
-        prevent_initial_call=True,
-    )
-    def close_all_positions(n):
-        if not (_trading_app and n):
-            raise dash.exceptions.PreventUpdate
-        try:
-            open_positions = len(_trading_app.portfolio.positions)
-            if open_positions == 0:
-                return "No open positions to close"
-            # Uses Alpaca bulk close endpoint for immediate flattening.
-            _trading_app.executor._client.close_all_positions(cancel_orders=True)
-            return f"Close-all requested for {open_positions} position(s)"
-        except Exception as e:
-            logger.error("Close all positions failed: %s", e)
-            return f"❌ Close-all failed: {e}"
 
     # ── Settings: health indicators ────────────────────────
     @app.callback(

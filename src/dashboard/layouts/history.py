@@ -86,20 +86,21 @@ def create_history_layout():
                     },
                 ],
                 style_data_conditional=[
-                    {"if": {"filter_query": "{side} = BUY"}, "color": "#10b981",
+                    # String literals with spaces must be double-quoted (DataTable filter_query grammar).
+                    {"if": {"filter_query": '{side} = "BUY"'}, "color": "#10b981",
                      "column_id": "side"},
-                    {"if": {"filter_query": "{side} = SELL"}, "color": "#ef4444",
+                    {"if": {"filter_query": '{side} = "SELL"'}, "color": "#ef4444",
                      "column_id": "side"},
                     {
-                        "if": {"filter_query": "{kind} = Declined recommendation"},
+                        "if": {"filter_query": '{kind} = "Declined recommendation"'},
                         "backgroundColor": "rgba(239,68,68,0.06)",
                     },
                     {
-                        "if": {"filter_query": "{kind} = Order placed"},
+                        "if": {"filter_query": '{kind} = "Order placed"'},
                         "backgroundColor": "rgba(59,130,246,0.04)",
                     },
                     {
-                        "if": {"filter_query": "{kind} = Approved recommendation"},
+                        "if": {"filter_query": '{kind} = "Approved recommendation"'},
                         "backgroundColor": "rgba(16,185,129,0.07)",
                     },
                 ],
